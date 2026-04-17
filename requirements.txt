@@ -1,3 +1,6 @@
 aiogram
 aiosqlite
 apscheduler
+pandas
+openpyxl
+nest_asyncio
