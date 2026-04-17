@@ -1,206 +1,312 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "4a425a28",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "!pip install aiogram aiosqlite apscheduler"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "d5ac014b",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "import asyncio\n",
-    "from aiogram import Bot, Dispatcher, types\n",
-    "from aiogram.filters import Command\n",
-    "import aiosqlite\n",
-    "from datetime import datetime, timedelta\n",
-    "from apscheduler.schedulers.asyncio import AsyncIOScheduler\n",
-    "\n",
-    "TOKEN = \"8774071198:AAEZ0baDm2bj6cUhLzBWU6PQkJS4j2kBMfI\"\n",
-    "\n",
-    "bot = Bot(token=TOKEN)\n",
-    "dp = Dispatcher()\n",
-    "scheduler = AsyncIOScheduler()\n",
-    "\n",
-    "# --- БАЗА ДАННЫХ ---\n",
-    "async def init_db():\n",
-    "    async with aiosqlite.connect(\"books.db\") as db:\n",
-    "        await db.execute(\"\"\"\n",
-    "        CREATE TABLE IF NOT EXISTS books (\n",
-    "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n",
-    "            title TEXT,\n",
-    "            author TEXT,\n",
-    "            status TEXT,\n",
-    "            user_id INTEGER,\n",
-    "            deadline TEXT\n",
-    "        )\n",
-    "        \"\"\")\n",
-    "        await db.commit()\n",
-    "\n",
-    "# --- ДОБАВИТЬ КНИГИ ---\n",
-    "async def seed_books():\n",
-    "    async with aiosqlite.connect(\"books.db\") as db:\n",
-    "        books = await db.execute(\"SELECT COUNT(*) FROM books\")\n",
-    "        count = (await books.fetchone())[0]\n",
-    "\n",
-    "        if count == 0:\n",
-    "            await db.executemany(\"\"\"\n",
-    "            INSERT INTO books (title, author, status)\n",
-    "            VALUES (?, ?, 'free')\n",
-    "            \"\"\", [\n",
-    "                (\"1984\", \"George Orwell\"),\n",
-    "                (\"The Hobbit\", \"J.R.R. Tolkien\"),\n",
-    "                (\"Crime and Punishment\", \"Dostoevsky\")\n",
-    "            ])\n",
-    "            await db.commit()\n",
-    "\n",
-    "# --- СПИСОК КНИГ ---\n",
-    "@dp.message(Command(\"books\"))\n",
-    "async def show_books(message: types.Message):\n",
-    "    async with aiosqlite.connect(\"books.db\") as db:\n",
-    "        cursor = await db.execute(\"SELECT id, title, author, status FROM books\")\n",
-    "        books = await cursor.fetchall()\n",
-    "\n",
-    "    text = \"📚 Список книг:\\n\\n\"\n",
-    "    for b in books:\n",
-    "        status = \"✅ Свободна\" if b[3] == \"free\" else \"❌ Занята\"\n",
-    "        text += f\"{b[0]}. {b[1]} — {b[2]} ({status})\\n\"\n",
-    "\n",
-    "    await message.answer(text)\n",
-    "\n",
-    "# --- БРОНЬ ---\n",
-    "@dp.message(Command(\"reserve\"))\n",
-    "async def reserve_book(message: types.Message):\n",
-    "    try:\n",
-    "        book_id = int(message.text.split()[1])\n",
-    "    except:\n",
-    "        await message.answer(\"Используй: /reserve ID\")\n",
-    "        return\n",
-    "\n",
-    "    async with aiosqlite.connect(\"books.db\") as db:\n",
-    "        cursor = await db.execute(\"SELECT status FROM books WHERE id=?\", (book_id,))\n",
-    "        book = await cursor.fetchone()\n",
-    "\n",
-    "        if not book:\n",
-    "            await message.answer(\"Книга не найдена\")\n",
-    "            return\n",
-    "\n",
-    "        if book[0] == \"taken\":\n",
-    "            await message.answer(\"❌ Уже занята\")\n",
-    "            return\n",
-    "\n",
-    "        deadline = datetime.now() + timedelta(days=7)\n",
-    "\n",
-    "        await db.execute(\"\"\"\n",
-    "        UPDATE books\n",
-    "        SET status='taken', user_id=?, deadline=?\n",
-    "        WHERE id=?\n",
-    "        \"\"\", (message.from_user.id, deadline.isoformat(), book_id))\n",
-    "\n",
-    "        await db.commit()\n",
-    "\n",
-    "    await message.answer(f\"✅ Забронировано до {deadline.date()}\")\n",
-    "\n",
-    "# --- ВОЗВРАТ ---\n",
-    "@dp.message(Command(\"return\"))\n",
-    "async def return_book(message: types.Message):\n",
-    "    try:\n",
-    "        book_id = int(message.text.split()[1])\n",
-    "    except:\n",
-    "        await message.answer(\"Используй: /return ID\")\n",
-    "        return\n",
-    "\n",
-    "    async with aiosqlite.connect(\"books.db\") as db:\n",
-    "        await db.execute(\"\"\"\n",
-    "        UPDATE books\n",
-    "        SET status='free', user_id=NULL, deadline=NULL\n",
-    "        WHERE id=?\n",
-    "        \"\"\", (book_id,))\n",
-    "        await db.commit()\n",
-    "\n",
-    "    await message.answer(\"📖 Книга возвращена\")\n",
-    "\n",
-    "# --- ПРОВЕРКА ДЕДЛАЙНОВ ---\n",
-    "async def check_deadlines():\n",
-    "    async with aiosqlite.connect(\"books.db\") as db:\n",
-    "        cursor = await db.execute(\"\"\"\n",
-    "        SELECT id, user_id, deadline FROM books\n",
-    "        WHERE status='taken'\n",
-    "        \"\"\")\n",
-    "        books = await cursor.fetchall()\n",
-    "\n",
-    "    now = datetime.now()\n",
-    "\n",
-    "    for b in books:\n",
-    "        deadline = datetime.fromisoformat(b[2])\n",
-    "        diff = (deadline - now).days\n",
-    "\n",
-    "        # Напоминание за 1 день\n",
-    "        if diff == 1:\n",
-    "            await bot.send_message(b[1], f\"⏰ Завтра дедлайн книги ID {b[0]}\")\n",
-    "\n",
-    "        # Просрочка\n",
-    "        if deadline < now:\n",
-    "            async with aiosqlite.connect(\"books.db\") as db:\n",
-    "                await db.execute(\"\"\"\n",
-    "                UPDATE books\n",
-    "                SET status='free', user_id=NULL, deadline=NULL\n",
-    "                WHERE id=?\n",
-    "                \"\"\", (b[0],))\n",
-    "                await db.commit()\n",
-    "\n",
-    "            await bot.send_message(b[1], f\"❗ Срок истёк. Книга ID {b[0]} освобождена\")\n",
-    "\n",
-    "# --- СТАРТ ---\n",
-    "async def main():\n",
-    "    await init_db()\n",
-    "    await seed_books()\n",
-    "\n",
-    "    scheduler.add_job(check_deadlines, \"interval\", hours=1)\n",
-    "    scheduler.start()\n",
-    "\n",
-    "    print(\"Бот запущен...\")\n",
-    "    await dp.start_polling(bot)\n",
-    "\n",
-    "await main()"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "cfe09a22",
-   "metadata": {},
-   "outputs": [],
-   "source": []
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3 (ipykernel)",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.11.4"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+get_ipython().system('pip install aiogram aiosqlite apscheduler')
+
+
+# In[ ]:
+
+
+import asyncio
+import nest_asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+import aiosqlite
+from datetime import datetime, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# Патч для работы в Jupyter
+nest_asyncio.apply()
+
+# Замените токен на новый (после отзыва старого)
+TOKEN = "8774071198:AAEZ0baDm2bj6cUhLzBWU6PQkJS4j2kBMfI"
+
+# --- КАТЕГОРИИ ---
+categories = {
+    "Фантастика": ["Dune", "Foundation", "Neuromancer"],
+    "Классика": ["1984", "Crime and Punishment"],
+    "Фэнтези": ["The Hobbit", "Lord of the Rings"]
 }
+
+PER_PAGE = 5
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+scheduler = AsyncIOScheduler()
+
+# --- БАЗА ДАННЫХ ---
+async def init_db():
+    async with aiosqlite.connect("books.db") as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            author TEXT,
+            status TEXT,
+            user_id INTEGER,
+            deadline TEXT
+        )
+        """)
+        await db.commit()
+
+# --- ДОБАВИТЬ КНИГИ ---
+async def seed_books():
+    async with aiosqlite.connect("books.db") as db:
+        books = await db.execute("SELECT COUNT(*) FROM books")
+        count = (await books.fetchone())[0]
+
+        if count == 0:
+            await db.executemany("""
+            INSERT INTO books (title, author, status)
+            VALUES (?, ?, 'free')
+            """, [
+                ("1984", "George Orwell"),
+                ("The Hobbit", "J.R.R. Tolkien"),
+                ("Crime and Punishment", "Dostoevsky")
+            ])
+            await db.commit()
+
+# --- СПИСОК КНИГ ---
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📚 Категории", callback_data="categories")],
+        [InlineKeyboardButton(text="📖 Мои книги", callback_data="my_books")]
+    ])
+
+async def books_menu(cat_name, page=0):
+    async with aiosqlite.connect("books.db") as db:
+        cursor = await db.execute("SELECT title FROM books WHERE status='taken'")
+        taken_books = [b[0] for b in await cursor.fetchall()]
+
+    books = categories[cat_name]
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+
+    kb = []
+
+    for book in books[start:end]:
+        if book in taken_books:
+            kb.append([InlineKeyboardButton(text=f"❌ {book}", callback_data="none")])
+        else:
+            kb.append([InlineKeyboardButton(text=f"📗 {book}", callback_data=f"book|{book}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"books|{cat_name}|{page-1}"))
+    if end < len(books):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"books|{cat_name}|{page+1}"))
+
+    if nav:
+        kb.append(nav)
+
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="categories")])
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def my_books_menu(user_id):
+    async with aiosqlite.connect("books.db") as db:
+        cursor = await db.execute("""
+        SELECT id, title FROM books WHERE user_id=?
+        """, (user_id,))
+        books = await cursor.fetchall()
+
+    kb = []
+
+    for b in books:
+        kb.append([
+            InlineKeyboardButton(
+                text=f"❌ Отменить: {b[1]}",
+                callback_data=f"cancel|{b[0]}"
+            )
+        ])
+
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")])
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def categories_menu():
+    kb = []
+    for cat in categories:
+        kb.append([InlineKeyboardButton(text=f"📖 {cat}", callback_data=f"cat|{cat}")])
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+@dp.message(Command("books"))
+async def show_books(message: types.Message):
+    async with aiosqlite.connect("books.db") as db:
+        cursor = await db.execute("SELECT id, title, author, status FROM books")
+        books = await cursor.fetchall()
+
+    text = "📚 Список книг:\n\n"
+    for b in books:
+        status = "✅ Свободна" if b[3] == "free" else "❌ Занята"
+        text += f"{b[0]}. {b[1]} — {b[2]} ({status})\n"
+
+    await message.answer(text)
+
+# --- БРОНЬ ---
+@dp.message(Command("reserve"))
+async def reserve_book(message: types.Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Используй: /reserve ID")
+        return
+    
+    try:
+        book_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    async with aiosqlite.connect("books.db") as db:
+        cursor = await db.execute("SELECT status FROM books WHERE id=?", (book_id,))
+        book = await cursor.fetchone()
+
+        if not book:
+            await message.answer("Книга не найдена")
+            return
+
+        if book[0] == "taken":
+            await message.answer("❌ Уже занята")
+            return
+
+        deadline = datetime.now() + timedelta(days=7)
+
+        await db.execute("""
+        UPDATE books
+        SET status='taken', user_id=?, deadline=?
+        WHERE id=?
+        """, (message.from_user.id, deadline.isoformat(), book_id))
+        await db.commit()
+
+    await message.answer(f"✅ Забронировано до {deadline.date()}")
+
+# --- ВОЗВРАТ ---
+@dp.message(Command("return"))
+async def return_book(message: types.Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Используй: /return ID")
+        return
+    
+    try:
+        book_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    async with aiosqlite.connect("books.db") as db:
+        await db.execute("""
+        UPDATE books
+        SET status='free', user_id=NULL, deadline=NULL
+        WHERE id=?
+        """, (book_id,))
+        await db.commit()
+
+    await message.answer("📖 Книга возвращена")
+    
+@dp.callback_query()
+async def callbacks(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    data = call.data
+
+    if data == "categories":
+        await call.message.edit_text("Выберите категорию:", reply_markup=categories_menu())
+
+    elif data.startswith("cat|"):
+        cat_name = data.split("|")[1]
+        kb = await books_menu(cat_name, 0)
+        await call.message.edit_text(f"📚 {cat_name}", reply_markup=kb)
+
+    elif data.startswith("books|"):
+        _, cat_name, page = data.split("|")
+        kb = await books_menu(cat_name, int(page))
+        await call.message.edit_text(f"📚 {cat_name}", reply_markup=kb)
+
+    elif data.startswith("book|"):
+        book_name = data.split("|")[1]
+
+        async with aiosqlite.connect("books.db") as db:
+            deadline = datetime.now() + timedelta(days=7)
+
+            await db.execute("""
+            UPDATE books
+            SET status='taken', user_id=?, deadline=?
+            WHERE title=?
+            """, (user_id, deadline.isoformat(), book_name))
+            await db.commit()
+
+        await call.answer("Забронировано!")
+        await call.message.answer(f"✅ {book_name} забронирована до {deadline.date()}")
+
+    elif data == "my_books":
+        kb = await my_books_menu(user_id)
+        await call.message.edit_text("📖 Ваши книги:", reply_markup=kb)
+
+    elif data.startswith("cancel|"):
+        book_id = int(data.split("|")[1])
+
+        async with aiosqlite.connect("books.db") as db:
+            await db.execute("""
+            UPDATE books
+            SET status='free', user_id=NULL, deadline=NULL
+            WHERE id=?
+            """, (book_id,))
+            await db.commit()
+
+        await call.answer("Отменено")
+        kb = await my_books_menu(user_id)
+        await call.message.edit_text("📖 Ваши книги:", reply_markup=kb)
+
+    elif data == "back_main":
+        await call.message.edit_text("Главное меню:", reply_markup=main_menu())
+
+    elif data == "none":
+        await call.answer("Книга занята ❌", show_alert=True)
+
+# --- ПРОВЕРКА ДЕДЛАЙНОВ ---
+async def check_deadlines():
+    async with aiosqlite.connect("books.db") as db:
+        cursor = await db.execute("""
+        SELECT id, user_id, deadline FROM books
+        WHERE status='taken'
+        """)
+        books = await cursor.fetchall()
+
+    now = datetime.now()
+    for b in books:
+        if not b[2]: continue
+        deadline = datetime.fromisoformat(b[2])
+        diff = (deadline - now).days
+
+        if diff == 0: # Напоминание в день дедлайна
+            await bot.send_message(b[1], f"⏰ Сегодня дедлайн книги ID {b[0]}!")
+
+        if deadline < now:
+            async with aiosqlite.connect("books.db") as db:
+                await db.execute("""
+                UPDATE books
+                SET status='free', user_id=NULL, deadline=NULL
+                WHERE id=?
+                """, (b[0],))
+                await db.commit()
+            await bot.send_message(b[1], f"❗ Срок истёк. Книга ID {b[0]} освобождена")
+
+# --- СТАРТ ---
+async def main():
+    await init_db()
+    await seed_books()
+
+    scheduler.add_job(check_deadlines, "interval", hours=1)
+    scheduler.start()
+
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+# Запуск в Jupyter
+await main()
